@@ -1,8 +1,9 @@
 """
 High-quality GIF converter using FFMPEG's two-pass palette method.
-- Asks for a folder, finds all PNG/JPG/GIF frames, sorts by filename
+- Accepts an MKV (or any video) file OR a folder of PNG/JPG/GIF frames
+- MKV mode: extracts frames at a chosen FPS before converting
 - Asks for an output width in pixels (height scales proportionally; Enter = keep original)
-- Saves the output GIF next to the folder
+- Saves the output GIF next to the source file/folder
 - Auto-installs ffmpeg if missing (downloads zip directly from GitHub on Windows)
 - Converts all frames to PNG before passing to ffmpeg (fixes GIF sequence issue)
 """
@@ -31,6 +32,7 @@ DITHER = "floyd_steinberg"
 
 SUPPORTED   = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif")
 NON_PNG     = (".gif", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif")
+VIDEO_EXTS  = (".mkv", ".mp4", ".mov", ".avi", ".webm", ".m4v", ".flv")
 
 FFMPEG_WIN_DIR = os.path.join(os.path.expanduser("~"), "ffmpeg")
 
@@ -168,43 +170,67 @@ def run(cmd):
         print("FFMPEG error:\n", result.stderr)
         sys.exit(1)
 
+def get_video_duration(video_path):
+    """Return video duration in seconds using ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+        capture_output=True, text=True
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+def extract_frames_from_video(video_path, out_dir, fps):
+    """Extract frames from a video file into out_dir as PNG sequence."""
+    out_pattern = os.path.join(out_dir, "frame_%06d.png")
+    print(f"-- Extracting frames at {fps} fps --")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vf", f"fps={fps}", out_pattern],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print("FFMPEG error during frame extraction:\n", result.stderr)
+        sys.exit(1)
+    extracted = sorted(f for f in os.listdir(out_dir) if f.endswith(".png"))
+    print(f"  Extracted {len(extracted)} frames.")
+    return extracted
+
 # -- MAIN ----------------------------------------------------------------------
 
 ensure_ffmpeg()
 
-# 1. Ask for folder
-folder = input("\nDrag your frames folder here (or paste the path): ").strip().strip('"').strip("'")
+# 1. Ask for input — video file or frames folder
+print("\nDrag a video file (MKV, MP4, MOV …) or a frames folder here:")
+raw_input = input("  > ").strip().strip('"').strip("'")
 
-if not os.path.isdir(folder):
-    print(f"Not a valid folder: {folder}")
+is_video  = os.path.isfile(raw_input) and raw_input.lower().endswith(VIDEO_EXTS)
+is_folder = os.path.isdir(raw_input)
+
+if not is_video and not is_folder:
+    ext = os.path.splitext(raw_input)[1].lower()
+    if os.path.isfile(raw_input) and ext not in VIDEO_EXTS:
+        print(f"Unsupported file type '{ext}'. Supported video types: {', '.join(VIDEO_EXTS)}")
+    else:
+        print(f"Not a valid file or folder: {raw_input}")
     sys.exit(1)
 
-# 2. Collect & sort frames
-frames = sorted(
-    [f for f in os.listdir(folder) if f.lower().endswith(SUPPORTED)],
-    key=lambda f: f.lower()
-)
+# 2. Output path (derived from source name, sits next to it)
+if is_video:
+    base_name  = os.path.splitext(os.path.basename(raw_input))[0]
+    output_dir = os.path.dirname(os.path.abspath(raw_input))
+else:
+    base_name  = os.path.basename(raw_input.rstrip("/\\"))
+    output_dir = os.path.dirname(os.path.abspath(raw_input))
 
-if not frames:
-    print(f"No supported image files found in: {folder}")
-    print(f"Supported types: {', '.join(SUPPORTED)}")
-    sys.exit(1)
-
-print(f"\nFound {len(frames)} frames")
-print(f"  First : {frames[0]}")
-print(f"  Last  : {frames[-1]}")
-
-# 3. Output path
-folder_name = os.path.basename(folder.rstrip("/\\"))
-output_dir  = os.path.dirname(os.path.abspath(folder))
-output      = os.path.join(output_dir, f"{folder_name}.gif")
-
+output = os.path.join(output_dir, f"{base_name}.gif")
 print(f"\n  Output -> {output}")
 confirm = input("  Looks good? [Y/n]: ").strip().lower()
 if confirm == "n":
     output = input("  Enter a custom output path (.gif): ").strip().strip('"').strip("'")
 
-# 3b. Ask for output width
+# 3. Output width
 print("\n-- Output size --")
 print("  Enter a width in pixels (height will scale proportionally).")
 print("  Press Enter to keep original size.")
@@ -223,44 +249,88 @@ while True:
     except ValueError:
         print("  Please enter a whole number greater than 0, or press Enter to skip.")
 
-# 4. Stage all frames as PNGs in a temp folder.
-# ffmpeg treats .gif files as video containers, not still images, so feeding
-# a .gif sequence breaks. Converting everything to PNG avoids this entirely.
-needs_conversion = any(f.lower().endswith(NON_PNG) for f in frames)
-if needs_conversion:
-    ensure_pillow()
-
-print("\n-- Preparing frames --")
+# 4. Video mode: ask for extraction FPS, then extract frames into a temp dir
 with tempfile.TemporaryDirectory() as tmp:
-    for i, fname in enumerate(frames):
-        src = os.path.join(folder, fname)
-        dst = os.path.join(tmp, f"frame_{i:06d}.png")
-        if fname.lower().endswith(".png"):
+
+    if is_video:
+        duration = get_video_duration(raw_input)
+        if duration:
+            print(f"\n  Video duration: {duration:.1f}s")
+        print("\n-- Frame extraction rate --")
+        print("  Lower FPS = fewer frames = smaller GIF (recommended: 10-15).")
+        print(f"  The GIF will also play back at this FPS.")
+        while True:
+            raw_fps = input(f"  FPS [default: {FPS}]: ").strip()
+            if raw_fps == "":
+                gif_fps = FPS
+                break
             try:
-                os.symlink(src, dst)
-            except (OSError, NotImplementedError):
-                shutil.copy2(src, dst)
-        else:
-            convert_to_png(src, dst)
+                gif_fps = int(raw_fps)
+                if gif_fps < 1:
+                    raise ValueError
+                break
+            except ValueError:
+                print("  Please enter a whole number greater than 0.")
 
-    input_pattern = os.path.join(tmp, "frame_%06d.png")
-    palette       = os.path.join(tmp, "palette.png")
+        extract_frames_from_video(raw_input, tmp, gif_fps)
+        frames = sorted(f for f in os.listdir(tmp) if f.endswith(".png"))
+        if not frames:
+            print("No frames were extracted. Check that the video file is valid.")
+            sys.exit(1)
+        input_pattern = os.path.join(tmp, "frame_%06d.png")
 
-    # Pass 1 - build a palette tuned to your actual content
-    print("-- Pass 1: Generating palette --")
+    else:
+        # Folder mode — same as before
+        gif_fps = FPS
+        frames = sorted(
+            [f for f in os.listdir(raw_input) if f.lower().endswith(SUPPORTED)],
+            key=lambda f: f.lower()
+        )
+        if not frames:
+            print(f"No supported image files found in: {raw_input}")
+            print(f"Supported types: {', '.join(SUPPORTED)}")
+            sys.exit(1)
+
+        print(f"\nFound {len(frames)} frames")
+        print(f"  First : {frames[0]}")
+        print(f"  Last  : {frames[-1]}")
+
+        # Convert non-PNG frames and symlink/copy PNGs into tmp
+        needs_conversion = any(f.lower().endswith(NON_PNG) for f in frames)
+        if needs_conversion:
+            ensure_pillow()
+
+        print("\n-- Preparing frames --")
+        for i, fname in enumerate(frames):
+            src = os.path.join(raw_input, fname)
+            dst = os.path.join(tmp, f"frame_{i:06d}.png")
+            if fname.lower().endswith(".png"):
+                try:
+                    os.symlink(src, dst)
+                except (OSError, NotImplementedError):
+                    shutil.copy2(src, dst)
+            else:
+                convert_to_png(src, dst)
+
+        input_pattern = os.path.join(tmp, "frame_%06d.png")
+
+    palette = os.path.join(tmp, "palette.png")
+
+    # Pass 1 — build palette from full animation
+    print("\n-- Pass 1: Generating palette --")
     run([
         "ffmpeg", "-y",
-        "-framerate", str(FPS),
+        "-framerate", str(gif_fps),
         "-i", input_pattern,
         "-vf", f"scale={WIDTH}:-1:flags=lanczos,palettegen=max_colors={COLORS}:stats_mode=full",
         palette
     ])
 
-    # Pass 2 - render the GIF using that palette
+    # Pass 2 — render GIF
     print("-- Pass 2: Rendering GIF --")
     run([
         "ffmpeg", "-y",
-        "-framerate", str(FPS),
+        "-framerate", str(gif_fps),
         "-i", input_pattern,
         "-i", palette,
         "-lavfi", f"scale={WIDTH}:-1:flags=lanczos [x]; [x][1:v] paletteuse=dither={DITHER}",
